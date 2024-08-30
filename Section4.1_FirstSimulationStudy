@@ -1,0 +1,84 @@
+library(readxl)
+library(InspectChangepoint)
+library(hdbinseg)
+library(xtable)
+library(iterators)
+library(foreach)
+library(parallel)
+library(doParallel)
+# TT = 500/2000/
+TT <- 500
+# N = 500/2000/
+N <- 500
+tau <- 0.4*TT
+N_tau <- length(tau)
+NN <- 1000
+#K <- 3/22/50/500/./3/45/200/2000/.
+KK <- c(3, ceiling(N^(0.5)), 0.1*N, N)
+#KK <- c(3, 22, 0.1*N, N)
+Phi = 0.2
+Del = 1.2
+
+lam2 = sqrt(log(TT)/log(log(TT)))
+R = rep(0,(TT-1))
+for (j in (TT-2):1) R = R+c((TT-1-j)*Phi^(j:1),rep(0,TT-1-j))
+L = rev(R)
+C = 1/(1-Phi^(2))
+y = rep(0,TT/2)
+for (j in 1:(TT/2)){
+  aa = 0
+  for (k in 1:j){
+  aa = aa + k*Phi^(k)
+  }
+  bb = 0
+  if(j<TT/2){
+  for (k in 1:(TT-2*j)){
+  bb = bb + j*Phi^(k+j)
+  }  
+  }
+  cc = 0
+  if(j>1){
+     for (k in 1:(j-1)){
+  cc = cc + k*Phi^(TT-k)
+  } 
+  }
+  y[j] = 2*(aa+bb+cc)
+}
+Y = c(y[1:(TT/2-1)],rev(y))
+
+#coress = 10
+#cl <- makeCluster(coress)
+#registerDoParallel(cl)
+
+SL_simu1 <- data.frame("T" = TT,"N" = N,"K" = 0, "SL(k3)" = 0, "SL(k10)" = 0, "Inspect(k3)" = 0, "Inspect(k10)" = 0, stringsAsFactors = FALSE)
+
+## SL, Inspect - parallal
+SL = matrix(nrow = 10, ncol = 1000)
+Inspect = matrix(nrow = 10, ncol = 1000)
+
+################################
+##Simulation (parallel)
+for (j in 1:4){
+  K = KK[j]
+  mu=(c(1:K)^(-0.5))*Del/sqrt(sum(c(1:K)^(-1)))
+  sl_inspect <- foreach(i=1:NN) %dopar% {
+    library(MASS)
+    library(InspectChangepoint)
+    library(hdbinseg)
+    set.seed(i)
+    seq=matrix(nrow=N,ncol=TT,data=0)
+    for (n in 1:N) {
+      seq[n,] = arima.sim(model=list(ar=Phi), n=TT)
+    }
+    seq[(1:K),((tau+1):TT)] = seq[(1:K),((tau+1):TT)] + mu
+    out1 = pl.est.AR1(seq = seq,lam2 = lam2,L = L,R = R,C = C,Y = Y)
+    out2 = locate.change(x=seq)$changepoint
+    c(out1, out2)
+  }
+for (i in 1:NN){
+    SL[j,i] = sl_inspect[[i]][1]
+    Inspect[j,i] = sl_inspect[[i]][2]
+}
+SL_simu1 <- rbind(SL_simu1,c(TT,N,K,sum(abs(SL[j,]-tau)<=3)/NN,sum(abs(SL[j,]-tau)<=10)/NN, sum(abs(Inspect[j,]-tau)<=3)/NN,sum(abs(Inspect[j,]-tau)<=10)/NN))    
+}
+print(xtable(SL_simu1,digits=c(0,0,0,0,3,3,3,3)),include.rownames = FALSE)
