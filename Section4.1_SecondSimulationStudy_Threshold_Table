@@ -1,0 +1,283 @@
+library(readxl)
+library(InspectChangepoint)
+library(hdbinseg)
+library(xtable)
+library(iterators)
+library(foreach)
+library(parallel)
+library(doParallel)
+
+############################
+### Parameters
+TT = 2000
+N = 200
+NN = 100
+K = 40
+Phi = 0.2
+C = 1/(1-Phi^(2))
+
+crit = 5.5
+crit2 = 18.7
+crit3 = 33.5
+crit4 = 5.3
+
+h=rep(1,times=61)
+for(i in 2:61) h[i]=ceiling(1.1*h[i-1])
+d=floor(h/c(1:61))
+
+lam1=1
+lam2=sqrt(log(TT)/log(log(TT)))
+
+#coress = 10
+#cl <- makeCluster(coress)
+#registerDoParallel(cl)
+
+########## parallel computing
+sl_est = rep(0,NN)
+inspect_est = rep(0,NN)
+dc_est = rep(0,NN)
+sbs_est = rep(0,NN)
+
+sl <- foreach(i=1:NN) %dopar% {
+  library(MASS)
+  library(hdbinseg)
+  library(InspectChangepoint)
+  set.seed(i)
+  seq=matrix(nrow=N,ncol=TT,data=0)
+  for (n in 1:N) {
+    seq[n,] = arima.sim(model=list(ar=Phi), n=TT)
+  }
+  val=pl.biject.AR1(seq,d,h,crit,lam1,lam2,Phi,C)
+  length(val)
+}
+
+inspect <- foreach(i=1:NN) %dopar% {
+  library(MASS)
+  library(hdbinseg)
+  library(InspectChangepoint)
+  set.seed(i)
+  seq=matrix(nrow=N,ncol=TT,data=0)
+  for (n in 1:N) {
+    seq[n,] = arima.sim(model=list(ar=Phi), n=TT)
+  }
+  val=inspect(seq, lambda = sqrt(0.5*log(N*log(TT))),threshold = crit2,M = 1000)$changepoints[,1]
+  length(val)
+}
+
+dc_sbs <- foreach(i=1:NN) %dopar% {
+  library(MASS)
+  library(hdbinseg)
+  library(InspectChangepoint)
+  set.seed(i)
+  seq=matrix(nrow=N,ncol=TT,data=0)
+  for (n in 1:N) {
+    seq[n,] = arima.sim(model=list(ar=Phi), n=TT)
+  }
+  val1 = dcbs.alg(seq, phi = -1, temporal = FALSE, thr = crit3, cp.type=1, do.parallel = 10)$ecp
+  val2 = sbs.alg(seq, temporal = FALSE, thr = rep(crit4,N),cp.type=1, do.parallel = 10)$ecp
+  c(length(val1),length(val2))
+}
+
+for (i in 1:NN){
+    if (sl[[i]]>0){
+      sl_est[i] = TRUE
+    }else{
+      sl_est[i] = FALSE
+    }
+  
+    if (inspect[[i]]>0){
+      inspect_est[i] = TRUE
+    }else{
+      inspect_est[i] = FALSE
+    }
+    if (dc_sbs[[i]][1]>0){
+      dc_est[i] = TRUE
+    }else{
+      dc_est[i] = FALSE
+    }
+    if (dc_sbs[[i]][2]>0){
+      sbs_est[i] = TRUE
+    }else{
+    sbs_est[i] = FALSE
+    }
+}
+
+mean(sl_est)
+mean(inspect_est)
+mean(dc_est)
+mean(sbs_est)
+
+## Function
+pl.det.AR1=function(csum,d,h,pen,crit,lam1,lam2,TTT,Phi,C){
+  
+  TT=ncol(csum)-1
+  N=nrow(csum)
+  L=length(d)
+  
+  lvec=c(1:(TT-1))
+  rvec=c((TT-1):1)
+  det=est=0
+  ell=ell1=1
+  
+  #detection
+  while(det==0 && ell<=L && TT>=d[ell1]+h[ell1]){
+    d0=d[ell]
+    h0=h[ell]
+    col=floor((TT-1)/d0)
+    mid=c(1:col)*d0+1
+    
+    beg=pmax(mid-h0,1)
+    end=pmin(mid+h0,TT+1)
+    
+    lvec=mid-beg
+    rvec=end-mid
+    w = apply(rbind(lvec,rvec),2,min)
+    
+    LL = RR = Y = rep(0,length(lvec))
+    for (j in 1:length(lvec)) {
+      if (rvec[j] > 1) {
+        for (k in 1:(rvec[j]-1)) {
+          RR[j] = RR[j] + k*Phi^(rvec[j]-k)
+        }
+      }
+      if (lvec[j] > 1){
+        for (k in 1:(lvec[j]-1)) {
+          LL[j] = LL[j] + k*Phi^(lvec[j]-k)
+        }
+      }
+    }
+    for (j in 1:length(Y)){
+      aa = 0
+      for (k in 1:w[j]){
+        aa = aa + k*Phi^(k)
+      }
+      bb = 0
+      if(lvec[j]+rvec[j]-2*w[j]>=1){
+        for (k in 1:(lvec[j]+rvec[j]-2*w[j])){
+          bb = bb + w[j]*Phi^(k+w[j])
+        }  
+      }
+      cc = 0
+      if(w[j]>1){
+        for (k in 1:(w[j]-1)){
+          cc = cc + k*Phi^(lvec[j]+rvec[j]-k)
+        } 
+      }
+      Y[j] = 2*(aa+bb+cc)
+    }
+    
+    lmean=t(csum[,mid]-csum[,beg])/lvec
+    rmean=t(csum[,end]-csum[,mid])/rvec
+    z=(rmean-lmean)/sqrt(C*((2*RR+rvec)/(rvec^2)+(2*LL+lvec)/(lvec^2)-Y/(lvec*rvec)))
+    z=t(z)
+    #pval=2*pnorm(-abs(z))
+    logpval=log(2)+pnorm(-abs(z),log.p=TRUE)
+    
+    #f=log(1+(lam1*log(N)/N)*(lam1/(pval*(2-log(pval))^2)-0.5)+(lam2/sqrt(N*log(N)))*(1/sqrt(pval)-2))
+    f=log(1+(lam1*log(N)/N)*(lam1/(exp(logpval)*(2-logpval)^2)-0.5)+(lam2/sqrt(N*log(N)))*(1/sqrt(exp(logpval))-2))
+    ps=apply(f,2,sum)-pen[ell]
+    
+    if(max(ps)>crit){
+      i=which.max(ps)
+      det=1
+      tval=beg[i]
+      vval=end[i]
+    }	
+    
+    if(det==0) ell=ell+1
+    ell1=min(ell,L)
+  }
+  
+  if(det>0){
+    
+    len=vval-tval
+    uval=tval+c(1:(len-1))
+    lvec=c(1:(len-1))
+    rvec=c((len-1):1)
+    w = apply(rbind(lvec,rvec),2,min)
+    
+    LL = RR = Y = rep(0,length(lvec))
+    for (j in 1:length(lvec)) {
+      if (rvec[j] > 1) {
+        for (k in 1:(rvec[j]-1)) {
+          RR[j] = RR[j] + k*Phi^(rvec[j]-k)
+        }
+      }
+      if (lvec[j] > 1){
+        for (k in 1:(lvec[j]-1)) {
+          LL[j] = LL[j] + k*Phi^(lvec[j]-k)
+        }
+      }
+    }
+    
+    for (j in 1:length(Y)){
+      aa = 0
+      for (k in 1:w[j]){
+        aa = aa + k*Phi^(k)
+      }
+      bb = 0
+      if(lvec[j]+rvec[j]-2*w[j]>=1){
+        for (k in 1:(lvec[j]+rvec[j]-2*w[j])){
+          bb = bb + w[j]*Phi^(k+w[j])
+        }  
+      }
+      cc = 0
+      if(w[j]>1){
+        for (k in 1:(w[j]-1)){
+          cc = cc + k*Phi^(lvec[j]+rvec[j]-k)
+        } 
+      }
+      Y[j] = 2*(aa+bb+cc)
+    }
+    
+    lmean=t(csum[,uval]-csum[,tval])/lvec
+    rmean=t(csum[,vval]-csum[,uval])/rvec
+    z=(rmean-lmean)/sqrt(C*((2*RR+rvec)/(rvec^2)+(2*LL+lvec)/(lvec^2)-Y/(lvec*rvec)))
+    z=t(z)
+    #pval=2*pnorm(-abs(z))
+    logpval=log(2)+pnorm(-abs(z),log.p=TRUE)
+    
+    f=log(1+(lam1*log(N)/N)*(lam1/(exp(logpval)*(2-logpval)^2)-0.5)+(lam2/sqrt(N*log(N)))*(1/sqrt(exp(logpval))-2))
+    #f=log(1+(log(N)/N)*(lam1/(pval*(2-log(pval))^2)-0.5)+(lam2/sqrt(N*log(N)))*(1/sqrt(pval)-2))
+    ps=apply(f,2,sum)-pen[ell]
+    #ps=ps-max(ps)
+    #eps=exp(ps)
+    #like=eps/sum(eps)
+    #est=floor(sum(like*c(1:(len-1)))+0.5)+tval
+    #clike=cumsum(like)
+    #est=sum(clike<0.5)+1+tval
+    est=which.max(ps)+tval
+  }
+  out=list(est=est,ell=ell)
+}
+
+pl.biject.AR1=function(seq,d,h,crit,lam1,lam2,Phi,C){
+  
+  TTT=ncol(seq)
+  N=nrow(seq)
+  L=length(d)
+  pen=log(TTT/(2*h))
+  tau=0
+  task=matrix(nrow=1,ncol=3,data=c(1,TTT,1))
+  
+  csum=matrix(nrow=N,ncol=TTT+1,data=0)
+  csum[,2:(TTT+1)]=t(apply(seq,1,cumsum))
+  r=1
+  while(r<=nrow(task)){
+    beg=task[r,1]
+    end=task[r,2]
+    ell=task[r,3]
+    dvec=d[ell:L]
+    hvec=h[ell:L]
+    pvec=pen[ell:L]
+    exe=pl.det.AR1(csum[,beg:(end+1)],dvec,hvec,pvec,crit,lam1,lam2,TTT,Phi,C)
+    r=r+1
+    if(exe$est>0){
+      est=beg+exe$est-2
+      task=rbind(task,c(beg,est,exe$ell))
+      task=rbind(task,c(est+1,end,exe$ell))
+      tau=c(tau,est)
+    }
+  }
+  sort(unique(tau[tau>0]))
+}
