@@ -1,0 +1,312 @@
+### Extract S&P500 index from Yahoo Finance
+library(plotly)
+library(tidyquant)
+library(tidyverse)
+library(fs)
+library(pdfetch)
+library(tseries)
+library(car)
+library(nortest)
+library(ggplot2)
+library(forecast)
+library(MVN)
+
+### Get data remained in the index for the whole period
+SP500_sym = tq_index("SP500")$symbol
+SP500_data = matrix(rep(0,length(SP500_sym)*3851),nrow = length(SP500_sym))
+j=1
+for (i in 1:length(SP500_sym)){
+  x = pdfetch_YAHOO(SP500_sym[i])[,4]
+  if (length(x)>=3851) {
+    SP500_data[j,] = x[1:3851]
+    j = j+1
+  }
+}
+RR = j-1
+SP500_data = SP500_data[1:RR,]
+SP500_data = SP500_data[which(rowSums(is.na(SP500_data))==0),]
+View(SP500_data)
+dim(SP500_data)
+#> dim(SP500_data)
+#[1]  428 3851
+
+####### ggplot of the whole dataset
+N = 5
+supp = matrix(t(matrix(rep(1:N,200),nrow = N)),ncol=1)
+index = rep(1:200,N)
+Y = matrix(t(SP500_data[1:N,])[1:200,], ncol=1)
+data = data.frame(supp,index,Y)
+
+ggplot(data, aes(x = factor(index), y = Y, color = supp))
+plot(1:dim(SP500_data)[2],SP500_data[150,])
+
+### Log transformation and first differencing of data
+SP500_data1 = log(SP500_data)
+SP500_data2 = sqrt(SP500_data)
+SP500_data2 = matrix(0, nrow = dim(SP500_data1)[1], ncol = dim(SP500_data1)[2]-1)
+for (i in 1:dim(SP500_data)[1]){
+  SP500_data2[i,] = diff(SP500_data1[i,])
+}
+#> dim(SP500_data2)
+#[1]  428 3850
+
+### Check the independence of each data sequence
+# calculate pairwise correlations
+cor_matrix <- cor(SP500_data2)
+View(cor_matrix)
+#Results show all correlations are close to zero, it suggests independence
+
+### Remove the series deviated from normality
+skew = rep(0,RR)
+id = 0
+for (i in 1:RR){
+  skew[i] = abs(skewness(SP500_data2[i,],method = "moment"))
+  if (skew[i]>0.5){
+    id = c(id,i)
+  }
+}
+id = id[-1]
+SP500_data3 = SP500_data2[-id,]
+dim(SP500_data3)
+N = dim(SP500_data3)[1]
+TT = dim(SP500_data3)[2]
+
+### Check the assumption of multivariate 
+# Example with mvnormtest package
+result = mvn(data = t(SP500_data3), mvnTest = c("mardia"))
+#result = mvn(data = t(SP500_data3[,2500:2850]), mvnTest = c("mardia"))
+result$multivariateNormality
+
+#> result$multivariateNormality
+#         Test        Statistic              p value       Result
+#2 Mardia Kurtosis 1.17027670956515    0.241889631443356    YES
+
+### Data transformation and check the stationarity of each data sequence
+SP500_data4 = matrix(0, nrow = 294, ncol = 3849)
+N = dim(SP500_data4)[1]
+TT = dim(SP500_data4)[2]
+for (i in 1:N){
+  SP500_data4[i,] = diff(SP500_data3[i,])
+}
+dim(SP500_data4)
+
+# Check stationarity of each sequence
+#ggAcf(SP500_data4[1,], lag.max = 20) +
+#  labs(title = "Autocorrelation Function (ACF)")
+
+### SL-temp Parameter setting
+h=rep(1,times=68)
+for(i in 2:68) h[i]=ceiling(1.1*h[i-1])
+d=floor(h/c(1:68))
+### check (h+d) smaller or equal than TT
+
+TT = 3849
+lam1=1
+lam2=sqrt(log(TT)/log(log(TT)))
+
+### check the sd of each sequence on SP500_data4
+xx = apply(SP500_data4,1,sd)
+
+### Standardized each time series (if needed) -- absolute mean deviation is based on normal assumption
+#SP500_data3 = matrix(numeric(TT*N),nrow=N)
+#for(n in 1:N){
+#  diff = SP500_data2[n,2:TT]-SP500_data2[n,1:(TT-1)]
+#  mad = median(abs(diff-median(diff)))
+##times 1.05?
+#  SP500_data3[n,]=SP500_data2[n,]/(1.05*mad)
+#}
+#View(SP500_data3)
+
+### Estimation of coefficient in AR(1)
+X = rbind(rep(1,N*(TT-1)),as.numeric(t(SP500_data4[,1:(TT-1)])))
+Y = as.numeric(t(SP500_data4[,2:TT]))
+para_est = solve(X%*%t(X))%*%X%*%matrix(Y,ncol = 1)
+df = (TT-1)*N-1-1
+var_est = sum((Y - para_est[2]*as.numeric(t(SP500_data4[,1:(TT-1)])))^(2))/df
+para_est
+var_est
+C = var_est/(1-para_est[2]^(2))
+Phi = para_est[2]
+C
+Phi
+
+### SL estimation of change-points
+crit = 4000
+val = pl.biject.AR1(SP500_data4,d,h,crit,lam1,lam2,Phi,C)
+#> val
+#[1]  447  449  460  462  481 3319 3320 3321
+
+### Function for SL with covariance structure varies
+pl.det.AR1=function(csum,d,h,pen,crit,lam1,lam2,TTT,Phi,C){
+  
+  TT=ncol(csum)-1
+  N=nrow(csum)
+  L=length(d)
+  
+  lvec=c(1:(TT-1))
+  rvec=c((TT-1):1)
+  det=est=0
+  ell=ell1=1
+  
+  #detection
+  while(det==0 && ell<=L && TT>=d[ell1]+h[ell1]){
+    d0=d[ell]
+    h0=h[ell]
+    col=floor((TT-1)/d0)
+    mid=c(1:col)*d0+1
+    
+    beg=pmax(mid-h0,1)
+    end=pmin(mid+h0,TT+1)
+    
+    lvec=mid-beg
+    rvec=end-mid
+    w = apply(rbind(lvec,rvec),2,min)
+    
+    LL = RR = Y = rep(0,length(lvec))
+    for (j in 1:length(lvec)) {
+      if (rvec[j] > 1) {
+        for (k in 1:(rvec[j]-1)) {
+          RR[j] = RR[j] + k*Phi^(rvec[j]-k)
+        }
+      }
+      if (lvec[j] > 1){
+        for (k in 1:(lvec[j]-1)) {
+          LL[j] = LL[j] + k*Phi^(lvec[j]-k)
+        }
+      }
+    }
+    for (j in 1:length(Y)){
+      aa = 0
+      for (k in 1:w[j]){
+        aa = aa + k*Phi^(k)
+      }
+      bb = 0
+      if(lvec[j]+rvec[j]-2*w[j]>=1){
+        for (k in 1:(lvec[j]+rvec[j]-2*w[j])){
+          bb = bb + w[j]*Phi^(k+w[j])
+        }  
+      }
+      cc = 0
+      if(w[j]>1){
+        for (k in 1:(w[j]-1)){
+          cc = cc + k*Phi^(lvec[j]+rvec[j]-k)
+        } 
+      }
+      Y[j] = 2*(aa+bb+cc)
+    }
+    
+    lmean=t(csum[,mid]-csum[,beg])/lvec
+    rmean=t(csum[,end]-csum[,mid])/rvec
+    z=(rmean-lmean)/sqrt(C*((2*RR+rvec)/(rvec^2)+(2*LL+lvec)/(lvec^2)-Y/(lvec*rvec)))
+    z=t(z)
+    #pval=2*pnorm(-abs(z))
+    logpval=log(2)+pnorm(-abs(z),log.p=TRUE)
+    
+    #f=log(1+(lam1*log(N)/N)*(lam1/(pval*(2-log(pval))^2)-0.5)+(lam2/sqrt(N*log(N)))*(1/sqrt(pval)-2))
+    f=log(1+(lam1*log(N)/N)*(lam1/(exp(logpval)*(2-logpval)^2)-0.5)+(lam2/sqrt(N*log(N)))*(1/sqrt(exp(logpval))-2))
+    ps=apply(f,2,sum)-pen[ell]
+    
+    if(max(ps)>crit){
+      i=which.max(ps)
+      det=1
+      tval=beg[i]
+      vval=end[i]
+    }	
+    
+    if(det==0) ell=ell+1
+    ell1=min(ell,L)
+  }
+  
+  if(det>0){
+    
+    len=vval-tval
+    uval=tval+c(1:(len-1))
+    lvec=c(1:(len-1))
+    rvec=c((len-1):1)
+    w = apply(rbind(lvec,rvec),2,min)
+    
+    LL = RR = Y = rep(0,length(lvec))
+    for (j in 1:length(lvec)) {
+      if (rvec[j] > 1) {
+        for (k in 1:(rvec[j]-1)) {
+          RR[j] = RR[j] + k*Phi^(rvec[j]-k)
+        }
+      }
+      if (lvec[j] > 1){
+        for (k in 1:(lvec[j]-1)) {
+          LL[j] = LL[j] + k*Phi^(lvec[j]-k)
+        }
+      }
+    }
+    
+    for (j in 1:length(Y)){
+      aa = 0
+      for (k in 1:w[j]){
+        aa = aa + k*Phi^(k)
+      }
+      bb = 0
+      if(lvec[j]+rvec[j]-2*w[j]>=1){
+        for (k in 1:(lvec[j]+rvec[j]-2*w[j])){
+          bb = bb + w[j]*Phi^(k+w[j])
+        }  
+      }
+      cc = 0
+      if(w[j]>1){
+        for (k in 1:(w[j]-1)){
+          cc = cc + k*Phi^(lvec[j]+rvec[j]-k)
+        } 
+      }
+      Y[j] = 2*(aa+bb+cc)
+    }
+    
+    lmean=t(csum[,uval]-csum[,tval])/lvec
+    rmean=t(csum[,vval]-csum[,uval])/rvec
+    z=(rmean-lmean)/sqrt(C*((2*RR+rvec)/(rvec^2)+(2*LL+lvec)/(lvec^2)-Y/(lvec*rvec)))
+    z=t(z)
+    #pval=2*pnorm(-abs(z))
+    logpval=log(2)+pnorm(-abs(z),log.p=TRUE)
+    
+    f=log(1+(lam1*log(N)/N)*(lam1/(exp(logpval)*(2-logpval)^2)-0.5)+(lam2/sqrt(N*log(N)))*(1/sqrt(exp(logpval))-2))
+    #f=log(1+(log(N)/N)*(lam1/(pval*(2-log(pval))^2)-0.5)+(lam2/sqrt(N*log(N)))*(1/sqrt(pval)-2))
+    ps=apply(f,2,sum)-pen[ell]
+    #ps=ps-max(ps)
+    #eps=exp(ps)
+    #like=eps/sum(eps)
+    #est=floor(sum(like*c(1:(len-1)))+0.5)+tval
+    #clike=cumsum(like)
+    #est=sum(clike<0.5)+1+tval
+    est=which.max(ps)+tval
+  }
+  out=list(est=est,ell=ell)
+}
+
+pl.biject.AR1=function(seq,d,h,crit,lam1,lam2,Phi,C){
+  
+  TTT=ncol(seq)
+  N=nrow(seq)
+  L=length(d)
+  pen=log(TTT/(2*h))
+  tau=0
+  task=matrix(nrow=1,ncol=3,data=c(1,TTT,1))
+  
+  csum=matrix(nrow=N,ncol=TTT+1,data=0)
+  csum[,2:(TTT+1)]=t(apply(seq,1,cumsum))
+  r=1
+  while(r<=nrow(task)){
+    beg=task[r,1]
+    end=task[r,2]
+    ell=task[r,3]
+    dvec=d[ell:L]
+    hvec=h[ell:L]
+    pvec=pen[ell:L]
+    exe=pl.det.AR1(csum[,beg:(end+1)],dvec,hvec,pvec,crit,lam1,lam2,TTT,Phi,C)
+    r=r+1
+    if(exe$est>0){
+      est=beg+exe$est-2
+      task=rbind(task,c(beg,est,exe$ell))
+      task=rbind(task,c(est+1,end,exe$ell))
+      tau=c(tau,est)
+    }
+  }
+  sort(unique(tau[tau>0]))
+}
